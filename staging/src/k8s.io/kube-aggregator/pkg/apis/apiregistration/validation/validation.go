@@ -67,7 +67,9 @@ func ValidateAPIService(apiService *apiregistration.APIService) field.ErrorList 
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "versionPriority"), apiService.Spec.VersionPriority, "must be positive and less than 1000"))
 	}
 
-	if apiService.Spec.Service == nil {
+	switch {
+	// TODO(irozzo) currently having both service and URL is not reported as an error.
+	case apiService.Spec.Service == nil && apiService.Spec.URL == nil:
 		if len(apiService.Spec.CABundle) != 0 {
 			allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "caBundle"), fmt.Sprintf("%d bytes", len(apiService.Spec.CABundle)), "local APIServices may not have a caBundle"))
 		}
@@ -75,21 +77,23 @@ func ValidateAPIService(apiService *apiregistration.APIService) field.ErrorList 
 			allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "insecureSkipTLSVerify"), apiService.Spec.InsecureSkipTLSVerify, "local APIServices may not have insecureSkipTLSVerify"))
 		}
 		return allErrs
+	case apiService.Spec.Service != nil:
+		if len(apiService.Spec.Service.Namespace) == 0 {
+			allErrs = append(allErrs, field.Required(field.NewPath("spec", "service", "namespace"), ""))
+		}
+		if len(apiService.Spec.Service.Name) == 0 {
+			allErrs = append(allErrs, field.Required(field.NewPath("spec", "service", "name"), ""))
+		}
+		if errs := utilvalidation.IsValidPortNum(int(apiService.Spec.Service.Port)); errs != nil {
+			allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "service", "port"), apiService.Spec.Service.Port, "port is not valid: "+strings.Join(errs, ", ")))
+		}
+	case apiService.Spec.URL != nil:
+		//TODO(irozzo) validate URL
 	}
 
-	if len(apiService.Spec.Service.Namespace) == 0 {
-		allErrs = append(allErrs, field.Required(field.NewPath("spec", "service", "namespace"), ""))
-	}
-	if len(apiService.Spec.Service.Name) == 0 {
-		allErrs = append(allErrs, field.Required(field.NewPath("spec", "service", "name"), ""))
-	}
-	if errs := utilvalidation.IsValidPortNum(int(apiService.Spec.Service.Port)); errs != nil {
-		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "service", "port"), apiService.Spec.Service.Port, "port is not valid: "+strings.Join(errs, ", ")))
-	}
 	if apiService.Spec.InsecureSkipTLSVerify && len(apiService.Spec.CABundle) > 0 {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "insecureSkipTLSVerify"), apiService.Spec.InsecureSkipTLSVerify, "may not be true if caBundle is present"))
 	}
-
 	return allErrs
 }
 

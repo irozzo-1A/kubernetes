@@ -157,7 +157,7 @@ func (c *AggregationController) sync(key string) (syncAction, error) {
 
 // AddAPIService adds a new API Service to OpenAPI Aggregation.
 func (c *AggregationController) AddAPIService(handler http.Handler, apiService *v1.APIService) {
-	if apiService.Spec.Service == nil {
+	if apiService.Spec.Service == nil && apiService.Spec.URL == nil {
 		return
 	}
 	if err := c.openAPIAggregationManager.AddUpdateAPIService(handler, apiService); err != nil {
@@ -168,7 +168,7 @@ func (c *AggregationController) AddAPIService(handler http.Handler, apiService *
 
 // UpdateAPIService updates API Service's info and handler.
 func (c *AggregationController) UpdateAPIService(handler http.Handler, apiService *v1.APIService) {
-	if apiService.Spec.Service == nil {
+	if apiService.Spec.Service == nil && apiService.Spec.URL == nil {
 		return
 	}
 	if err := c.openAPIAggregationManager.AddUpdateAPIService(handler, apiService); err != nil {

@@ -30,6 +30,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/server/egressselector"
 	v1listers "k8s.io/client-go/listers/core/v1"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -125,8 +126,11 @@ func setupAPIServices(apiServices []*apiregistration.APIService) (*AvailableCond
 		apiServiceLister: listers.NewAPIServiceLister(apiServiceIndexer),
 		serviceLister:    v1listers.NewServiceLister(serviceIndexer),
 		endpointsLister:  v1listers.NewEndpointsLister(endpointsIndexer),
-		discoveryClient:  testServer.Client(),
-		serviceResolver:  &fakeServiceResolver{url: testServer.URL},
+		discoveryClient: map[egressselector.EgressType]*http.Client{
+			egressselector.Cluster: testServer.Client(),
+			egressselector.Master:  testServer.Client(),
+		},
+		serviceResolver: &fakeServiceResolver{url: testServer.URL},
 		queue: workqueue.NewNamedRateLimitingQueue(
 			// We want a fairly tight requeue time.  The controller listens to the API, but because it relies on the routability of the
 			// service network, it is possible for an external, non-watchable factor to affect availability.  This keeps
@@ -354,8 +358,11 @@ func TestSync(t *testing.T) {
 				apiServiceLister: listers.NewAPIServiceLister(apiServiceIndexer),
 				serviceLister:    v1listers.NewServiceLister(serviceIndexer),
 				endpointsLister:  v1listers.NewEndpointsLister(endpointsIndexer),
-				discoveryClient:  testServer.Client(),
-				serviceResolver:  &fakeServiceResolver{url: testServer.URL},
+				discoveryClient: map[egressselector.EgressType]*http.Client{
+					egressselector.Cluster: testServer.Client(),
+					egressselector.Master:  testServer.Client(),
+				},
+				serviceResolver: &fakeServiceResolver{url: testServer.URL},
 			}
 			c.sync(tc.apiServiceName)
 

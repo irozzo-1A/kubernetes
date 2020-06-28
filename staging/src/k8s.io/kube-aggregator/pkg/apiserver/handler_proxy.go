@@ -70,9 +70,39 @@ type proxyHandler struct {
 	egressSelector *egressselector.EgressSelector
 }
 
+type APIServiceType int
+
+const (
+	Local APIServiceType = iota
+	Service
+	URL
+)
+
+func (a APIServiceType) NetworkContext() egressselector.NetworkContext {
+	switch a {
+	case URL:
+		return egressselector.Master.AsNetworkContext()
+	case Service:
+		return egressselector.Cluster.AsNetworkContext()
+	default:
+		return egressselector.Master.AsNetworkContext()
+	}
+}
+
+type serviceInfo struct {
+	// serviceName is the name of the service this handler proxies to
+	serviceName string
+	// namespace is the namespace the service lives in
+	serviceNamespace string
+	// serviceAvailable indicates this APIService is available or not
+	serviceAvailable bool
+	// servicePort is the port of the service this handler proxies to
+	servicePort int32
+}
+
 type proxyHandlingInfo struct {
-	// local indicates that this APIService is locally satisfied
-	local bool
+	// serviceType indicates that this APIService is locally satisfied
+	serviceType APIServiceType
 
 	// name is the name of the APIService
 	name string
@@ -83,14 +113,12 @@ type proxyHandlingInfo struct {
 	transportBuildingError error
 	// proxyRoundTripper is the re-useable portion of the transport.  It does not vary with any request.
 	proxyRoundTripper http.RoundTripper
-	// serviceName is the name of the service this handler proxies to
-	serviceName string
-	// namespace is the namespace the service lives in
-	serviceNamespace string
-	// serviceAvailable indicates this APIService is available or not
-	serviceAvailable bool
-	// servicePort is the port of the service this handler proxies to
-	servicePort int32
+	// serviceInfo holds service information used when the APIService is of
+	// type service.
+	serviceInfo
+	// url holds the url of the service. It is only used when the service is of
+	// type URL.
+	url string
 }
 
 func proxyError(w http.ResponseWriter, req *http.Request, error string, code int) {
@@ -113,7 +141,7 @@ func (r *proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	handlingInfo := value.(proxyHandlingInfo)
-	if handlingInfo.local {
+	if handlingInfo.serviceType == Local {
 		if r.localDelegate == nil {
 			http.Error(w, "", http.StatusNotFound)
 			return
@@ -122,7 +150,7 @@ func (r *proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if !handlingInfo.serviceAvailable {
+	if handlingInfo.serviceType == Service && !handlingInfo.serviceAvailable {
 		proxyError(w, req, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -140,16 +168,21 @@ func (r *proxyHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// write a new location based on the existing request pointed at the target service
 	location := &url.URL{}
-	location.Scheme = "https"
-	rloc, err := r.serviceResolver.ResolveEndpoint(handlingInfo.serviceNamespace, handlingInfo.serviceName, handlingInfo.servicePort)
-	if err != nil {
-		klog.Errorf("error resolving %s/%s: %v", handlingInfo.serviceNamespace, handlingInfo.serviceName, err)
-		proxyError(w, req, "service unavailable", http.StatusServiceUnavailable)
-		return
+	switch handlingInfo.serviceType {
+	case Service:
+		location.Scheme = "https"
+		rloc, err := r.serviceResolver.ResolveEndpoint(handlingInfo.serviceNamespace, handlingInfo.serviceName, handlingInfo.servicePort)
+		if err != nil {
+			klog.Errorf("error resolving %s/%s: %v", handlingInfo.serviceNamespace, handlingInfo.serviceName, err)
+			proxyError(w, req, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		location.Host = rloc.Host
+		location.Path = req.URL.Path
+		location.RawQuery = req.URL.Query().Encode()
+	case URL:
+		location, _ = url.Parse(handlingInfo.serviceNamespace)
 	}
-	location.Host = rloc.Host
-	location.Path = req.URL.Path
-	location.RawQuery = req.URL.Query().Encode()
 
 	newReq, cancelFn := newRequestForProxy(location, req)
 	defer cancelFn()
@@ -243,29 +276,51 @@ func (r *responder) Error(_ http.ResponseWriter, _ *http.Request, err error) {
 // these methods provide locked access to fields
 
 func (r *proxyHandler) updateAPIService(apiService *apiregistrationv1api.APIService) {
-	if apiService.Spec.Service == nil {
-		r.handlingInfo.Store(proxyHandlingInfo{local: true})
+	if apiService.Spec.Service == nil && apiService.Spec.URL == nil {
+		r.handlingInfo.Store(proxyHandlingInfo{serviceType: Local})
 		return
 	}
 
-	newInfo := proxyHandlingInfo{
-		name: apiService.Name,
-		restConfig: &restclient.Config{
-			TLSClientConfig: restclient.TLSClientConfig{
-				Insecure:   apiService.Spec.InsecureSkipTLSVerify,
-				ServerName: apiService.Spec.Service.Name + "." + apiService.Spec.Service.Namespace + ".svc",
-				CertData:   r.proxyClientCert,
-				KeyData:    r.proxyClientKey,
-				CAData:     apiService.Spec.CABundle,
+	var newInfo proxyHandlingInfo
+	if apiService.Spec.URL != nil {
+		newInfo = proxyHandlingInfo{
+			name:        apiService.Name,
+			serviceType: URL,
+			restConfig: &restclient.Config{
+				TLSClientConfig: restclient.TLSClientConfig{
+					Insecure:   apiService.Spec.InsecureSkipTLSVerify,
+					ServerName: *apiService.Spec.URL,
+					CertData:   r.proxyClientCert,
+					KeyData:    r.proxyClientKey,
+					CAData:     apiService.Spec.CABundle,
+				},
 			},
-		},
-		serviceName:      apiService.Spec.Service.Name,
-		serviceNamespace: apiService.Spec.Service.Namespace,
-		servicePort:      *apiService.Spec.Service.Port,
-		serviceAvailable: apiregistrationv1apihelper.IsAPIServiceConditionTrue(apiService, apiregistrationv1api.Available),
+			url: *apiService.Spec.URL,
+		}
+	}
+	if apiService.Spec.Service != nil {
+		newInfo = proxyHandlingInfo{
+			name:        apiService.Name,
+			serviceType: Service,
+			restConfig: &restclient.Config{
+				TLSClientConfig: restclient.TLSClientConfig{
+					Insecure:   apiService.Spec.InsecureSkipTLSVerify,
+					ServerName: apiService.Spec.Service.Name + "." + apiService.Spec.Service.Namespace + ".svc",
+					CertData:   r.proxyClientCert,
+					KeyData:    r.proxyClientKey,
+					CAData:     apiService.Spec.CABundle,
+				},
+			},
+			serviceInfo: serviceInfo{
+				serviceName:      apiService.Spec.Service.Name,
+				serviceNamespace: apiService.Spec.Service.Namespace,
+				servicePort:      *apiService.Spec.Service.Port,
+				serviceAvailable: apiregistrationv1apihelper.IsAPIServiceConditionTrue(apiService, apiregistrationv1api.Available),
+			},
+		}
 	}
 	if r.egressSelector != nil {
-		networkContext := egressselector.Cluster.AsNetworkContext()
+		networkContext := newInfo.serviceType.NetworkContext()
 		var egressDialer utilnet.DialFunc
 		egressDialer, err := r.egressSelector.Lookup(networkContext)
 		if err != nil {

@@ -87,6 +87,9 @@ func (c *REST) ConvertToTable(ctx context.Context, obj runtime.Object, tableOpti
 	table.Rows, err = metatable.MetaToTableRow(obj, func(obj runtime.Object, m metav1.Object, name, age string) ([]interface{}, error) {
 		svc := obj.(*apiregistration.APIService)
 		service := "Local"
+		if svc.Spec.URL != nil {
+			service = *svc.Spec.URL
+		}
 		if svc.Spec.Service != nil {
 			service = fmt.Sprintf("%s/%s", svc.Spec.Service.Namespace, svc.Spec.Service.Name)
 		}

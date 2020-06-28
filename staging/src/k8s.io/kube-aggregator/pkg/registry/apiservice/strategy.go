@@ -55,7 +55,7 @@ func (apiServerStrategy) PrepareForCreate(ctx context.Context, obj runtime.Objec
 	apiservice.Status = apiregistration.APIServiceStatus{}
 
 	// mark local API services as immediately available on create
-	if apiservice.Spec.Service == nil {
+	if apiservice.Spec.Service == nil && apiservice.Spec.URL == nil {
 		apiregistration.SetAPIServiceCondition(apiservice, apiregistration.NewLocalAvailableAPIServiceCondition())
 	}
 }

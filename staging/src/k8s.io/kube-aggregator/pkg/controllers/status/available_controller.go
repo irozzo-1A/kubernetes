@@ -70,7 +70,7 @@ type AvailableConditionController struct {
 	endpointsLister v1listers.EndpointsLister
 	endpointsSynced cache.InformerSynced
 
-	discoveryClient *http.Client
+	discoveryClient map[egressselector.EgressType]*http.Client
 	serviceResolver ServiceResolver
 
 	// To allow injection for testing.
@@ -104,6 +104,7 @@ func NewAvailableConditionController(
 		endpointsLister:  endpointsInformer.Lister(),
 		endpointsSynced:  endpointsInformer.Informer().HasSynced,
 		serviceResolver:  serviceResolver,
+		discoveryClient:  map[egressselector.EgressType]*http.Client{},
 		queue: workqueue.NewNamedRateLimitingQueue(
 			// We want a fairly tight requeue time.  The controller listens to the API, but because it relies on the routability of the
 			// service network, it is possible for an external, non-watchable factor to affect availability.  This keeps
@@ -112,37 +113,14 @@ func NewAvailableConditionController(
 			"AvailableConditionController"),
 	}
 
-	// if a particular transport was specified, use that otherwise build one
-	// construct an http client that will ignore TLS verification (if someone owns the network and messes with your status
-	// that's not so bad) and sets a very short timeout.  This is a best effort GET that provides no additional information
-	restConfig := &rest.Config{
-		TLSClientConfig: rest.TLSClientConfig{
-			Insecure: true,
-			CertData: proxyClientCert,
-			KeyData:  proxyClientKey,
-		},
-	}
-
-	if egressSelector != nil {
-		networkContext := egressselector.Cluster.AsNetworkContext()
-		var egressDialer utilnet.DialFunc
-		egressDialer, err := egressSelector.Lookup(networkContext)
-		if err != nil {
-			return nil, err
-		}
-		restConfig.Dial = egressDialer
-	} else if proxyTransport != nil && proxyTransport.DialContext != nil {
-		restConfig.Dial = proxyTransport.DialContext
-	}
-
-	transport, err := rest.TransportFor(restConfig)
+	var err error
+	c.discoveryClient[egressselector.Cluster], err = buildClient(proxyTransport, proxyClientCert, proxyClientKey, egressSelector, egressselector.Cluster)
 	if err != nil {
 		return nil, err
 	}
-	c.discoveryClient = &http.Client{
-		Transport: transport,
-		// the request should happen quickly.
-		Timeout: 5 * time.Second,
+	c.discoveryClient[egressselector.Master], err = buildClient(proxyTransport, proxyClientCert, proxyClientKey, egressSelector, egressselector.Master)
+	if err != nil {
+		return nil, err
 	}
 
 	// resync on this one because it is low cardinality and rechecking the actual discovery
@@ -192,95 +170,173 @@ func (c *AvailableConditionController) sync(key string) error {
 	}
 
 	// local API services are always considered available
-	if apiService.Spec.Service == nil {
+	if apiService.Spec.Service == nil && apiService.Spec.URL == nil {
 		apiregistrationv1apihelper.SetAPIServiceCondition(apiService, apiregistrationv1apihelper.NewLocalAvailableAPIServiceCondition())
 		_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
 		return err
 	}
 
-	service, err := c.serviceLister.Services(apiService.Spec.Service.Namespace).Get(apiService.Spec.Service.Name)
-	if apierrors.IsNotFound(err) {
-		availableCondition.Status = apiregistrationv1.ConditionFalse
-		availableCondition.Reason = "ServiceNotFound"
-		availableCondition.Message = fmt.Sprintf("service/%s in %q is not present", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace)
-		apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
-		_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
-		return err
-	} else if err != nil {
-		availableCondition.Status = apiregistrationv1.ConditionUnknown
-		availableCondition.Reason = "ServiceAccessError"
-		availableCondition.Message = fmt.Sprintf("service/%s in %q cannot be checked due to: %v", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, err)
-		apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
-		_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
-		return err
-	}
-
-	if service.Spec.Type == v1.ServiceTypeClusterIP {
-		// if we have a cluster IP service, it must be listening on configured port and we can check that
-		servicePort := apiService.Spec.Service.Port
-		portName := ""
-		foundPort := false
-		for _, port := range service.Spec.Ports {
-			if port.Port == *servicePort {
-				foundPort = true
-				portName = port.Name
-				break
-			}
-		}
-		if !foundPort {
-			availableCondition.Status = apiregistrationv1.ConditionFalse
-			availableCondition.Reason = "ServicePortError"
-			availableCondition.Message = fmt.Sprintf("service/%s in %q is not listening on port %d", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, *apiService.Spec.Service.Port)
-			apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
-			_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
-			return err
-		}
-
-		endpoints, err := c.endpointsLister.Endpoints(apiService.Spec.Service.Namespace).Get(apiService.Spec.Service.Name)
+	if apiService.Spec.Service != nil {
+		service, err := c.serviceLister.Services(apiService.Spec.Service.Namespace).Get(apiService.Spec.Service.Name)
 		if apierrors.IsNotFound(err) {
 			availableCondition.Status = apiregistrationv1.ConditionFalse
-			availableCondition.Reason = "EndpointsNotFound"
-			availableCondition.Message = fmt.Sprintf("cannot find endpoints for service/%s in %q", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace)
+			availableCondition.Reason = "ServiceNotFound"
+			availableCondition.Message = fmt.Sprintf("service/%s in %q is not present", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace)
 			apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
 			_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
 			return err
 		} else if err != nil {
 			availableCondition.Status = apiregistrationv1.ConditionUnknown
-			availableCondition.Reason = "EndpointsAccessError"
+			availableCondition.Reason = "ServiceAccessError"
 			availableCondition.Message = fmt.Sprintf("service/%s in %q cannot be checked due to: %v", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, err)
 			apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
 			_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
 			return err
 		}
-		hasActiveEndpoints := false
-	outer:
-		for _, subset := range endpoints.Subsets {
-			if len(subset.Addresses) == 0 {
-				continue
-			}
-			for _, endpointPort := range subset.Ports {
-				if endpointPort.Name == portName {
-					hasActiveEndpoints = true
-					break outer
+
+		if service.Spec.Type == v1.ServiceTypeClusterIP {
+			// if we have a cluster IP service, it must be listening on configured port and we can check that
+			servicePort := apiService.Spec.Service.Port
+			portName := ""
+			foundPort := false
+			for _, port := range service.Spec.Ports {
+				if port.Port == *servicePort {
+					foundPort = true
+					portName = port.Name
+					break
 				}
 			}
+			if !foundPort {
+				availableCondition.Status = apiregistrationv1.ConditionFalse
+				availableCondition.Reason = "ServicePortError"
+				availableCondition.Message = fmt.Sprintf("service/%s in %q is not listening on port %d", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, *apiService.Spec.Service.Port)
+				apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+				_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
+				return err
+			}
+
+			endpoints, err := c.endpointsLister.Endpoints(apiService.Spec.Service.Namespace).Get(apiService.Spec.Service.Name)
+			if apierrors.IsNotFound(err) {
+				availableCondition.Status = apiregistrationv1.ConditionFalse
+				availableCondition.Reason = "EndpointsNotFound"
+				availableCondition.Message = fmt.Sprintf("cannot find endpoints for service/%s in %q", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace)
+				apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+				_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
+				return err
+			} else if err != nil {
+				availableCondition.Status = apiregistrationv1.ConditionUnknown
+				availableCondition.Reason = "EndpointsAccessError"
+				availableCondition.Message = fmt.Sprintf("service/%s in %q cannot be checked due to: %v", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, err)
+				apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+				_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
+				return err
+			}
+			hasActiveEndpoints := false
+		outer:
+			for _, subset := range endpoints.Subsets {
+				if len(subset.Addresses) == 0 {
+					continue
+				}
+				for _, endpointPort := range subset.Ports {
+					if endpointPort.Name == portName {
+						hasActiveEndpoints = true
+						break outer
+					}
+				}
+			}
+			if !hasActiveEndpoints {
+				availableCondition.Status = apiregistrationv1.ConditionFalse
+				availableCondition.Reason = "MissingEndpoints"
+				availableCondition.Message = fmt.Sprintf("endpoints for service/%s in %q have no addresses with port name %q", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, portName)
+				apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+				_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
+				return err
+			}
 		}
-		if !hasActiveEndpoints {
-			availableCondition.Status = apiregistrationv1.ConditionFalse
-			availableCondition.Reason = "MissingEndpoints"
-			availableCondition.Message = fmt.Sprintf("endpoints for service/%s in %q have no addresses with port name %q", apiService.Spec.Service.Name, apiService.Spec.Service.Namespace, portName)
-			apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
-			_, err := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
-			return err
+		// actually try to hit the discovery endpoint when it isn't local and when we're routing as a service.
+		if apiService.Spec.Service != nil && c.serviceResolver != nil {
+			attempts := 5
+			results := make(chan error, attempts)
+			for i := 0; i < attempts; i++ {
+				go func() {
+					discoveryURL, err := c.serviceResolver.ResolveEndpoint(apiService.Spec.Service.Namespace, apiService.Spec.Service.Name, *apiService.Spec.Service.Port)
+					if err != nil {
+						results <- err
+						return
+					}
+					discoveryURL.Path = "/apis/" + apiService.Spec.Group + "/" + apiService.Spec.Version
+
+					errCh := make(chan error)
+					go func() {
+						// be sure to check a URL that the aggregated API server is required to serve
+						newReq, err := http.NewRequest("GET", discoveryURL.String(), nil)
+						if err != nil {
+							errCh <- err
+							return
+						}
+
+						// setting the system-masters identity ensures that we will always have access rights
+						transport.SetAuthProxyHeaders(newReq, "system:kube-aggregator", []string{"system:masters"}, nil)
+						resp, err := c.discoveryClient[egressselector.Cluster].Do(newReq)
+						if resp != nil {
+							resp.Body.Close()
+							// we should always been in the 200s or 300s
+							if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+								errCh <- fmt.Errorf("bad status from %v: %v", discoveryURL, resp.StatusCode)
+								return
+							}
+						}
+
+						errCh <- err
+					}()
+
+					select {
+					case err = <-errCh:
+						if err != nil {
+							results <- fmt.Errorf("failing or missing response from %v: %v", discoveryURL, err)
+							return
+						}
+
+						// we had trouble with slow dial and DNS responses causing us to wait too long.
+						// we added this as insurance
+					case <-time.After(6 * time.Second):
+						results <- fmt.Errorf("timed out waiting for %v", discoveryURL)
+						return
+					}
+
+					results <- nil
+				}()
+			}
+
+			var lastError error
+			for i := 0; i < attempts; i++ {
+				lastError = <-results
+				// if we had at least one success, we are successful overall and we can return now
+				if lastError == nil {
+					break
+				}
+			}
+
+			if lastError != nil {
+				availableCondition.Status = apiregistrationv1.ConditionFalse
+				availableCondition.Reason = "FailedDiscoveryCheck"
+				availableCondition.Message = lastError.Error()
+				apiregistrationv1apihelper.SetAPIServiceCondition(apiService, availableCondition)
+				_, updateErr := updateAPIServiceStatus(c.apiServiceClient, originalAPIService, apiService)
+				if updateErr != nil {
+					return updateErr
+				}
+				// force a requeue to make it very obvious that this will be retried at some point in the future
+				// along with other requeues done via service change, endpoint change, and resync
+				return lastError
+			}
 		}
-	}
-	// actually try to hit the discovery endpoint when it isn't local and when we're routing as a service.
-	if apiService.Spec.Service != nil && c.serviceResolver != nil {
+	} else {
 		attempts := 5
 		results := make(chan error, attempts)
 		for i := 0; i < attempts; i++ {
 			go func() {
-				discoveryURL, err := c.serviceResolver.ResolveEndpoint(apiService.Spec.Service.Namespace, apiService.Spec.Service.Name, *apiService.Spec.Service.Port)
+				discoveryURL, err := url.Parse(*apiService.Spec.URL)
 				if err != nil {
 					results <- err
 					return
@@ -303,7 +359,7 @@ func (c *AvailableConditionController) sync(key string) error {
 
 					// setting the system-masters identity ensures that we will always have access rights
 					transport.SetAuthProxyHeaders(newReq, "system:kube-aggregator", []string{"system:masters"}, nil)
-					resp, err := c.discoveryClient.Do(newReq)
+					resp, err := c.discoveryClient[egressselector.Master].Do(newReq)
 					if resp != nil {
 						resp.Body.Close()
 						// we should always been in the 200s or 300s
@@ -587,4 +643,45 @@ func setUnavailableCounter(originalAPIService, newAPIService *apiregistrationv1.
 		}
 		unavailableCounter.WithLabelValues(newAPIService.Name, reason).Inc()
 	}
+}
+
+func buildClient(
+	proxyTransport *http.Transport,
+	proxyClientCert []byte,
+	proxyClientKey []byte,
+	egressSelector *egressselector.EgressSelector,
+	egressType egressselector.EgressType,
+) (*http.Client, error) {
+	// if a particular transport was specified, use that otherwise build one
+	// construct an http client that will ignore TLS verification (if someone owns the network and messes with your status
+	// that's not so bad) and sets a very short timeout.  This is a best effort GET that provides no additional information
+	restConfig := &rest.Config{
+		TLSClientConfig: rest.TLSClientConfig{
+			Insecure: true,
+			CertData: proxyClientCert,
+			KeyData:  proxyClientKey,
+		},
+	}
+
+	if egressSelector != nil {
+		networkContext := egressType.AsNetworkContext()
+		var egressDialer utilnet.DialFunc
+		egressDialer, err := egressSelector.Lookup(networkContext)
+		if err != nil {
+			return nil, err
+		}
+		restConfig.Dial = egressDialer
+	} else if proxyTransport != nil && proxyTransport.DialContext != nil {
+		restConfig.Dial = proxyTransport.DialContext
+	}
+
+	transport, err := rest.TransportFor(restConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{
+		Transport: transport,
+		// the request should happen quickly.
+		Timeout: 5 * time.Second,
+	}, nil
 }
